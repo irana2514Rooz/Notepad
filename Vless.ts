@@ -1,0 +1,269 @@
+import { isValidUUID } from '@common';
+import {
+    safeCloseTcpSocket,
+    handleTCPOutBound,
+    makeReadableWebSocketStream,
+    WS_READY_STATE_OPEN
+} from './common';
+
+export async function VlOverWSHandler(request: Request, ctx: ExecutionContext): Promise<Response> {
+    const webSocketPair = new WebSocketPair();
+    const [client, webSocket] = Object.values(webSocketPair);
+    webSocket.accept();
+
+    let address = "";
+    let portWithRandomLog = "";
+
+    const log = (info: string, event?: string) => {
+        console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
+    };
+
+    const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+    const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
+
+    let remoteSocketWapper: { value: Socket | null } = { value: null };
+    let udpStreamWrite: any = null;
+    let isDns = false;
+
+    let connectionBytes = 0;
+
+    const writableStream = new WritableStream({
+        async write(chunk) {
+            if (chunk && chunk.byteLength) {
+                connectionBytes += chunk.byteLength;
+                
+                if (connectionBytes >= 1024 * 1024) {
+                    const bytesToUpdate = connectionBytes;
+                    connectionBytes = 0; 
+                    
+                    const { userID } = globalThis.globalConfig; 
+                    
+                    if (globalThis.env && globalThis.env.DB && userID) {
+                        ctx.waitUntil(
+                            globalThis.env.DB.prepare(
+                                "UPDATE users SET used_quota_bytes = used_quota_bytes + ? WHERE uuid = ?"
+                            ).bind(bytesToUpdate, userID).run()
+                        );
+                    }
+                }
+            }
+
+            if (isDns && udpStreamWrite) {
+                return udpStreamWrite(chunk);
+            }
+
+            if (remoteSocketWapper.value) {
+                const writer = remoteSocketWapper.value.writable.getWriter();
+                await writer.write(chunk);
+                writer.releaseLock();
+                return;
+            }
+
+            const { userID } = globalThis.globalConfig;
+            const {
+                hasError,
+                message,
+                portRemote = 443,
+                addressRemote = "",
+                rawClientData,
+            } = parseVlessHeader(chunk, userID);
+
+            address = addressRemote;
+            portWithRandomLog = `${portRemote}`;
+
+            if (hasError) {
+                log(message);
+                safeCloseWebSocket(webSocket);
+                return;
+            }
+
+            if (addressRemote === "dns-query") {
+                isDns = true;
+                if (rawClientData && rawClientData.byteLength === 0) {
+                    return;
+                }
+                udpStreamWrite = makeDoHStream(webSocket, log);
+                udpStreamWrite(rawClientData);
+                return;
+            }
+
+            log(`connecting to ${addressRemote}:${portRemote}`);
+            
+            try {
+                const tcpSocket = await handleTCPOutBound(
+                    remoteSocketWapper,
+                    addressRemote,
+                    portRemote,
+                    rawClientData,
+                    webSocket,
+                    new Uint8Array([0, 0]),
+                    log
+                );
+                
+                tcpSocket.readable
+                    .pipeTo(
+                        new WritableStream({
+                            async write(chunk) {
+                                if (chunk && chunk.byteLength) {
+                                    connectionBytes += chunk.byteLength;
+                                    if (connectionBytes >= 1024 * 1024) {
+                                        const bytesToUpdate = connectionBytes;
+                                        connectionBytes = 0;
+                                        if (globalThis.env && globalThis.env.DB && userID) {
+                                            ctx.waitUntil(
+                                                globalThis.env.DB.prepare(
+                                                    "UPDATE users SET used_quota_bytes = used_quota_bytes + ? WHERE uuid = ?"
+                                                ).bind(bytesToUpdate, userID).run()
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                                    webSocket.send(chunk);
+                                }
+                            },
+                            close() {
+                                log(`remote connection close`);
+                                safeCloseWebSocket(webSocket);
+                            },
+                            abort(reason) {
+                                log(`remote connection abort`, reason);
+                                safeCloseWebSocket(webSocket);
+                            },
+                        })
+                    )
+                    .catch((error) => {
+                        log(`pipeline error`, error.message);
+                        safeCloseWebSocket(webSocket);
+                    });
+
+            } catch (error: any) {
+                log(`connect to ${addressRemote}:${portRemote} failed: ${error.message}`);
+                safeCloseWebSocket(webSocket);
+            }
+        },
+        close() {
+            log(`client connection close`);
+            safeCloseTcpSocket(remoteSocketWapper.value);
+        },
+        abort(reason) {
+            log(`client connection abort`, reason);
+            safeCloseTcpSocket(remoteSocketWapper.value);
+        },
+    });
+
+    readableWebSocketStream
+        .pipeTo(writableStream)
+        .catch((error) => {
+            log(`readableWebSocketStream error`, error.message);
+            safeCloseTcpSocket(remoteSocketWapper.value);
+        });
+
+    return new Response(null, { status: 101, webSocket: client });
+}
+
+function parseVlessHeader(chunk: ArrayBuffer, userID: string) {
+    if (chunk.byteLength < 24) {
+        return { hasError: true, message: "invalid chunk length" };
+    }
+    const view = new DataView(chunk);
+    const version = view.getUint8(0);
+    
+    let id = "";
+    for (let i = 1; i < 17; i++) {
+        id += view.getUint8(i).toString(16).padStart(2, "0");
+        if ([4, 6, 8, 10].includes(i)) id += "-";
+    }
+
+    if (id !== userID || !isValidUUID(id)) {
+        return { hasError: true, message: `authentication failed for ID: ${id}` };
+    }
+
+    const addonLength = view.getUint8(17);
+    let offset = 18 + addonLength;
+    
+    const command = view.getUint8(offset);
+    offset += 1;
+    
+    const portRemote = view.getUint16(offset);
+    offset += 2;
+    
+    const addressType = view.getUint8(offset);
+    offset += 1;
+    
+    let addressRemote = "";
+    if (addressType === 1) {
+        addressRemote = `${view.getUint8(offset)}.${view.getUint8(offset+1)}.${view.getUint8(offset+2)}.${view.getUint8(offset+3)}`;
+        offset += 4;
+    } else if (addressType === 2) {
+        const domainLength = view.getUint8(offset);
+        offset += 1;
+        const domainBuffer = new Uint8Array(chunk, offset, domainLength);
+        addressRemote = new TextDecoder().decode(domainBuffer);
+        offset += domainLength;
+    } else if (addressType === 3) {
+        addressRemote = "ipv6-address-parsed"; 
+        offset += 16;
+    }
+
+    return {
+        hasError: false,
+        message: "success",
+        portRemote,
+        addressRemote,
+        rawClientData: chunk.slice(offset)
+    };
+}
+
+function makeDoHStream(webSocket: WebSocket, log: Function) {
+    const transformStream = new TransformStream();
+    let isVLHeaderSent = false;
+    const VLResponseHeader = new Uint8Array([0, 0]);
+
+    transformStream.readable
+        .pipeTo(
+            new WritableStream({
+                async write(chunk) {
+                    const resp = await fetch("https://cloudflare-dns.com/dns-query", {
+                        method: "POST",
+                        headers: {
+                            "content-type": "application/dns-message",
+                        },
+                        body: chunk
+                    });
+
+                    const dnsQueryResult = await resp.arrayBuffer();
+                    const udpSize = dnsQueryResult.byteLength;
+                    const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+
+                    if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                        if (isVLHeaderSent) {
+                            webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+                        } else {
+                            webSocket.send(await new Blob([VLResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+                            isVLHeaderSent = true;
+                        }
+                    }
+                },
+            })
+        )
+        .catch((error) => {
+            log("dns udp has error " + error);
+        });
+
+    const writer = transformStream.writable.getWriter();
+    return (chunk: ArrayBuffer) => {
+        writer.write(chunk);
+    };
+}
+
+function safeCloseWebSocket(socket: WebSocket) {
+    try {
+        if (socket.readyState === WS_READY_STATE_OPEN) {
+            socket.close();
+        }
+    } catch (error) {
+        console.error('safeCloseWebSocket error', error);
+    }
+}
