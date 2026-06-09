@@ -13,17 +13,15 @@ import {
 	handleProxyIPs
 } from '@handlers';
 
-// تابع کمکی برای پیدا کردن UUID کاربر از روی آدرس درخواست
+// تابع کمکی برای پیدا کردن UUID کاربر از روی آدرس درخواست ساب یا وب‌سوکت
 function extractUUID(request: Request): string | null {
 	const url = new URL(request.url);
 	const pathName = url.pathname;
 	
-	// ۱. اگر درخواست برای لینک ساب‌اسکریپشن باشد: /sub/UUID
 	if (pathName.startsWith('/sub/')) {
 		return pathName.split('/')[2] || null;
 	}
 	
-	// ۲. اگر درخواست اتصال فیلترشکن (WebSocket) باشد
 	const encodedPathConfig = pathName.replace("/", "");
 	try {
 		const decoded = JSON.parse(atob(encodedPathConfig));
@@ -41,16 +39,15 @@ export default {
 			const path = pathName.split('/')[1];
 
 			// -----------------------------------------------------------------
-			// --- بخش ۱: اندپوینت مدیریت کاربران مخفی (ساخت، حذف و تمدید) ---
+			// ۱. اندپوینت مدیریت کاربران مخفی (ساخت، حذف و تمدید از طریق لینک)
 			// -----------------------------------------------------------------
 			if (path === 'manage-users') {
 				const secret = url.searchParams.get('secret');
-				const action = url.searchParams.get('action'); // add, delete
+				const action = url.searchParams.get('action'); 
 				const uuid = url.searchParams.get('uuid');
-				const quota = url.searchParams.get('quota') || "50"; // پیش‌فرض ۵۰ گیگ
+				const quota = url.searchParams.get('quota') || "50"; 
 				const name = url.searchParams.get('name') || "User";
 
-				// لایه امنیتی: حتماً این رمز را به یک عبارت سخت تغییر بده
 				if (secret !== "YOUR_SECRET_ADMIN_PASSWORD") {
 					return new Response('Unauthorized', { status: 401 });
 				}
@@ -66,59 +63,59 @@ export default {
 				
 				if (action === 'delete' && env.DB) {
 					await env.DB.prepare("DELETE FROM users WHERE uuid = ?").bind(uuid).run();
-					return new Response(`User [${uuid}] has been deleted from database.`, { status: 200 });
+					return new Response(`User [${uuid}] has been deleted.`, { status: 200 });
 				}
-				return new Response('Invalid action. Use action=add or action=delete', { status: 400 });
+				return new Response('Invalid action.', { status: 400 });
 			}
 
 			// -----------------------------------------------------------------
-			// --- بخش ۲: لایه امنیتی فیلتر حجم و وضعیت کاربران از دیتابیس D1 ---
+			// ۲. لایه کنترل ترافیک و حجم کاربران از دیتابیس D1
 			// -----------------------------------------------------------------
-			const upgradeHeader = request.headers.get('Upgrade');
 			init(request, env);
-
 			const userUUID = extractUUID(request);
+			
 			if (userUUID && env.DB) {
-				// استعلام زنده وضعیت حجم کاربر از دیتابیس D1
 				const user: any = await env.DB.prepare(
 					"SELECT total_quota_gb, used_quota_bytes, status FROM users WHERE uuid = ?"
 				).bind(userUUID).first();
 
 				if (user) {
 					const totalBytes = user.total_quota_gb * 1024 * 1024 * 1024;
-					
-					// اگر حجم تمام شده بود یا کاربر مسدود شده بود، اتصال را کاملاً قطع کن
 					if (user.used_quota_bytes >= totalBytes || user.status !== 'active') {
 						return new Response('Traffic Limit Exceeded or Account Expired.', { 
 							status: 403,
 							headers: { 'Content-Type': 'text/plain; charset=utf-8' }
 						});
 					}
-					// ذخیره اطلاعات کاربر در حافظه موقت برای استفاده در هندلر ساب‌اسکریپشن
 					globalThis.currentUserD1 = user;
 				}
 			}
-			// -----------------------------------------------------------------
 
+			// -----------------------------------------------------------------
+			// ۳. هدایت درخواست‌ها به هسته اصلی پنل وب BPB و وب‌سوکت‌ها
+			// -----------------------------------------------------------------
+			const upgradeHeader = request.headers.get('Upgrade');
 			if (upgradeHeader === 'websocket') {
 				initWs(env);
-				// پاس دادن پارامتر ctx برای عملیات‌های پس‌زمینه در VLESS
 				return await handleWebsocket(request, ctx);
 			} else {
 				initHttp(request, env);
 
+				// باز کردن دسترسی به صفحات پنل اصلی مدیریت
+				if (pathName === '/' || path === 'panel' || path === 'login' || path === 'api') {
+					// فراخوانی مستقیم توابع پنل اصلی بدون مسدودسازی
+					if (path === 'login') return await handleLogin(request, env);
+					if (path === 'logout') return logout();
+					return await handlePanel(request, env); 
+				}
+
 				switch (path) {
-					case 'panel':
-						return await handlePanel(request, env);
-
 					case 'sub':
-						return await handleSubscriptions(request, env);
-
-					case 'login':
-						return await handleLogin(request, env);
-
-					case 'logout':
-						return logout();
+						// فقط اگر کاربر در دیتابیس مجاز بود لینک ساب کار کند
+						if (globalThis.currentUserD1) {
+							return await handleSubscriptions(request, env);
+						}
+						return new Response('Invalid or Unauthorized Subscription Link', { status: 403 });
 
 					case 'secrets':
 						return await renderSecrets();
